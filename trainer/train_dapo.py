@@ -78,17 +78,102 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -args.max_seq_len:]
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -args.max_seq_len:]
 
-        rollout_result = rollout_engine.rollout(
-            prompt_ids=prompt_inputs["input_ids"],
-            attention_mask=prompt_inputs["attention_mask"],
-            num_generations=args.num_generations,
-            max_new_tokens=args.max_gen_len,
-            temperature=0.8,
-        )
-        outputs = rollout_result.output_ids
-        completion_ids = rollout_result.completion_ids
-        completions = rollout_result.completions
-        old_per_token_logps = rollout_result.per_token_logps.to(args.device)
+        # rollout_result = rollout_engine.rollout(
+        #     prompt_ids=prompt_inputs["input_ids"],
+        #     attention_mask=prompt_inputs["attention_mask"],
+        #     num_generations=args.num_generations,
+        #     max_new_tokens=args.max_gen_len,
+        #     temperature=0.8,
+        # )
+        # outputs = rollout_result.output_ids
+        # completion_ids = rollout_result.completion_ids
+        # completions = rollout_result.completions
+        # old_per_token_logps = rollout_result.per_token_logps.to(args.device)
+
+        B_original = len(prompts)
+        G = args.num_generations
+        target_B = B_original  # 我们要凑够的有效 prompt 数
+        # 收集有效样本的容器
+        valid_prompts = []  # list of str
+        valid_outputs = []  # list of tensors [G, seq_len] -> finally [B*G, seq_len]
+        valid_completion_ids = []  # list of tensors [G, comp_len]
+        valid_completions = []  # list of str (flat, B*G)
+        valid_old_logps = []  # list of tensors [G, seq_len]  (if not re-compute)
+        valid_rewards = []  # list of tensors [G]
+
+        current_prompts = prompts  # list of str, length cur_B
+        while len(valid_prompts) < target_B:
+
+            prompt_inputs_cur = tokenizer(
+                current_prompts,
+                return_tensors="pt", padding=True,
+                return_token_type_ids=False,
+                padding_side="left",
+                add_special_tokens=False
+            ).to(args.device)
+            if args.max_seq_len:
+                prompt_inputs_cur["input_ids"] = prompt_inputs_cur["input_ids"][:, -args.max_seq_len:]
+                prompt_inputs_cur["attention_mask"] = prompt_inputs_cur["attention_mask"][:, -args.max_seq_len:]
+            rollout_result_cur = rollout_engine.rollout(
+                prompt_ids=prompt_inputs_cur["input_ids"],
+                attention_mask=prompt_inputs_cur["attention_mask"],
+                num_generations=G,
+                max_new_tokens=args.max_gen_len,
+                temperature=0.8,
+            )
+
+            cur_completions = rollout_result_cur.completions  # list of str, length cur_B * G
+            cur_outputs = rollout_result_cur.output_ids  # [cur_B*G, seq_len]
+            cur_completion_ids = rollout_result_cur.completion_ids  # [cur_B*G, comp_len]
+            cur_old_logps = rollout_result_cur.per_token_logps.to(args.device)  # [cur_B*G, seq_len]
+
+            cur_rewards = calculate_rewards(
+                current_prompts, cur_completions, reward_model
+            ).to(args.device)
+
+            grouped = cur_rewards.view(-1, G)  # [cur_B, G]
+            accuracy = grouped.mean(dim=1)  # [cur_B]
+            # all right = 1, all wrong =0
+            valid_mask = (accuracy > 0.0) & (accuracy < 1.0)
+            valid_indices = torch.where(valid_mask)[0]
+            # --- collect valid group ---
+            for idx in valid_indices:
+                # prompt
+                valid_prompts.append(current_prompts[idx])
+
+                start = idx * G
+                end = (idx + 1) * G
+
+                valid_outputs.append(cur_outputs[start:end])  # [G, seq_len]
+                valid_completion_ids.append(cur_completion_ids[start:end])  # [G, comp_len]
+
+                valid_completions.extend(cur_completions[start:end])
+                valid_old_logps.append(cur_old_logps[start:end])  # [G, seq_len]
+                valid_rewards.append(cur_rewards[start:end])  # [G]
+            # Check if it is full
+            needed = target_B - len(valid_prompts)
+            if needed > 0:
+                # from dataloader get new prompts
+
+                new_prompts = []
+                while len(new_prompts) < needed:
+                    try:
+                        next_batch = next(iters)
+                    except StopIteration:
+                        dataloader_iter = iter(loader)
+                        next_batch = next(dataloader_iter)
+                    batch_prompts = next_batch['prompt']
+                    new_prompts.extend(batch_prompts)
+                current_prompts = new_prompts[:needed]  # trunc how we need
+            else:
+                break
+
+        prompts = valid_prompts  # list of str, length target_B
+        outputs = torch.cat(valid_outputs, dim=0)  # [target_B * G, seq_len]
+        completion_ids = torch.cat(valid_completion_ids, dim=0)  # [target_B * G, comp_len]
+        completions = valid_completions  # list of str, length target_B * G
+        old_per_token_logps = torch.cat(valid_old_logps, dim=0)  # [target_B * G, seq_len]
+        rewards = torch.cat(valid_rewards, dim=0)  # [target_B * G]
 
         model_unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
         with autocast_ctx:
@@ -96,15 +181,16 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
                 res = model_unwrapped(outputs)
                 aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
                 logits = res.logits[:, :-1, :]
-                per_token_logps = F.log_softmax(logits, dim=-1).gather(2, outputs[:, 1:].unsqueeze(-1)).squeeze(-1)[:,
-                                  -completion_ids.size(1):]
+                per_token_logps = F.log_softmax(logits, dim=-1).gather(
+                    2, outputs[:, 1:].unsqueeze(-1)
+                ).squeeze(-1)[:, -completion_ids.size(1):]
             else:
                 aux_loss = torch.tensor(0.0, device=args.device)
-                per_token_logps = rollout_result.per_token_logps
-
+                per_token_logps = old_per_token_logps  # 直接使用存储的 logps
         with torch.no_grad():
-            ref_per_token_logps = compute_per_token_logps(ref_model, outputs, completion_ids.size(1))
-        rewards = calculate_rewards(prompts, completions, reward_model).to(args.device)  # [B*num_gen]
+            ref_per_token_logps = compute_per_token_logps(
+                ref_model, outputs, completion_ids.size(1)
+            )
 
         if args.debug_mode and is_main_process() and step % args.debug_interval == 0:
             for i in range(len(prompts)):
