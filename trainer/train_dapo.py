@@ -67,6 +67,28 @@ def calculate_rewards(prompts, responses, reward_model):
 
     return rewards
 
+def compute_overlong_penalty(lengths, args):
+    """
+    lengths: [B*num_gen] number of tokens in each response
+    returns: [B*num_gen] length penalty for each response
+    """
+    if args.overlong_penalty_type == "linear":
+        # 超出 max_len 的部分线性惩罚
+        exceed = torch.clamp(lengths - args.max_response_len, min=0)
+        return exceed.float() * args.overlong_penalty_coef  # λ
+    elif args.overlong_penalty_type == "quadratic":
+        exceed = torch.clamp(lengths - args.max_response_len, min=0)
+        return (exceed.float() ** 2) * args.overlong_penalty_coef
+    elif args.overlong_penalty_type == "ratio":
+        # 总长度比例惩罚
+        return (lengths.float() / args.max_response_len) * args.overlong_penalty_coef
+    elif args.overlong_penalty_type == "continuous":
+        # 对所有 token 做连续惩罚（不设阈值）
+        return lengths.float() * args.overlong_penalty_coef
+    else:
+        return torch.zeros_like(lengths, dtype=torch.float)
+
+
 
 def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model, start_step=0, wandb=None,
                      use_sglang=False):
@@ -207,6 +229,17 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
                     Logger(f"[DEBUG] gen[{j}] reward={rewards[idx].item():.4f}")
                 Logger('=' * 100)
 
+<<<<<<< HEAD
+=======
+        completion_lengths = completion_mask.sum(dim=1)  # [B*num_gen]
+        overlong_penalty = compute_overlong_penalty(completion_lengths, args)  # [B*num_gen]
+        rewards = rewards - overlong_penalty
+
+        grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]
+        mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
+        std_r = grouped_rewards.std(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
+        advantages = (rewards - mean_r) / (std_r + 1e-4)  # [B*num_gen]
+>>>>>>> feature/dapo-overlong-reward
 
         is_eos = completion_ids == tokenizer.eos_token_id  # [B*num_gen, R]
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=args.device)
@@ -344,6 +377,8 @@ if __name__ == "__main__":
     parser.add_argument("--sglang_base_url", type=str, default="http://localhost:8998", help="SGLang服务器URL")
     parser.add_argument("--sglang_model_path", type=str, default="../model", help="SGLang tokenizer路径")
     parser.add_argument("--sglang_shared_path", type=str, default="./sglang_ckpt_grpo", help="SGLang共享存储路径")
+    parser.add_argument("--overlong_penalty_type", type=str, default="linear", help="罚函数类型")
+
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
