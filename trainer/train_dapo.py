@@ -144,7 +144,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             per_token_loss1 = ratio * advantages.unsqueeze(1)
             per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
             per_token_loss = -(torch.min(per_token_loss1, per_token_loss2) - args.beta * per_token_kl)
-        policy_loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        policy_loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
         loss = (policy_loss + aux_loss) / args.accumulation_steps  # scalar
         loss.backward()
 
