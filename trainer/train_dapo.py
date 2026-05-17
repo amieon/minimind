@@ -121,17 +121,21 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
                     Logger(f"[DEBUG] gen[{j}] reward={rewards[idx].item():.4f}")
                 Logger('=' * 100)
 
-        grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]
-        mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
-        std_r = grouped_rewards.std(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
-        advantages = (rewards - mean_r) / (std_r + 1e-4)  # [B*num_gen]
 
         is_eos = completion_ids == tokenizer.eos_token_id  # [B*num_gen, R]
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=args.device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         completion_mask = (
-                    torch.arange(is_eos.size(1), device=args.device).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(
-                1)).int()  # [B*num_gen, R]
+                torch.arange(is_eos.size(1), device=args.device).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(
+            1)).int()  # [B*num_gen, R]
+
+        per_token_rewards = (rewards / completion_mask.sum(dim=1)).unsqueeze(1) * completion_mask
+        returns = torch.flip(torch.cumsum(torch.flip(per_token_rewards, dims=[1]), dim=1), dims=[1])
+        returns_sum = (returns * completion_mask).sum(dim=1)  # [B*num_gen]
+        grouped = returns_sum.view(-1, args.num_generations)  # [B, num_gen]
+        mean_r = grouped.mean(dim=1).repeat_interleave(args.num_generations)
+        std_r = grouped.std(dim=1).repeat_interleave(args.num_generations)
+        advantages = (returns - mean_r.unsqueeze(1)) / (std_r.unsqueeze(1) + 1e-4)
 
         kl_div = ref_per_token_logps - per_token_logps
         per_token_kl = torch.exp(kl_div) - kl_div - 1  # [B*num_gen, R]
@@ -162,7 +166,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             avg_reward_val = rewards.mean().item()
             avg_len_val = completion_mask.sum(dim=1).float().mean().item()
             kl_ref_val = ((
-                                      ref_per_token_logps - per_token_logps) * completion_mask).sum().item() / completion_mask.sum().item()
+                                  ref_per_token_logps - per_token_logps) * completion_mask).sum().item() / completion_mask.sum().item()
             advantages_mean_val = advantages.mean().item()
             advantages_std_val = advantages.std().item()
             current_lr = optimizer.param_groups[0]['lr']
