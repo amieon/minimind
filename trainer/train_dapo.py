@@ -139,6 +139,11 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         if args.loss_type == "cispo":
             clamped_ratio = torch.clamp(ratio, max=args.epsilon_high).detach()
             per_token_loss = -(clamped_ratio * advantages.unsqueeze(1) * per_token_logps - args.beta * per_token_kl)
+        elif args.loss_type == "dapo":
+            clipped_ratio = torch.clamp(ratio, 1 - args.epsilon_low, 1 + args.epsilon_high)
+            per_token_loss1 = ratio * advantages.unsqueeze(1)
+            per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)  # 无 KL 惩罚
         else:
             clipped_ratio = torch.clamp(ratio, 1 - args.epsilon, 1 + args.epsilon)
             per_token_loss1 = ratio * advantages.unsqueeze(1)
@@ -233,6 +238,7 @@ if __name__ == "__main__":
     parser.add_argument("--loss_type", type=str, default="cispo", choices=["grpo", "cispo"], help="loss类型")
     parser.add_argument("--epsilon", type=float, default=0.2, help="GRPO的PPO clip epsilon")
     parser.add_argument("--epsilon_high", type=float, default=5.0, help="epsilon上界")
+    parser.add_argument("--epsilon_low", type=float, default=0.2, help="epsilon下界")
     parser.add_argument('--from_weight', default='full_sft', type=str, help="基于哪个权重训练")
     parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward模型路径")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
