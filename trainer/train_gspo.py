@@ -135,7 +135,13 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
 
         kl_div = ref_per_token_logps - per_token_logps
         per_token_kl = torch.exp(kl_div) - kl_div - 1  # [B*num_gen, R]
-        ratio = torch.exp(per_token_logps - old_per_token_logps)  # [B*num_gen, R]
+
+        #ratio = torch.exp(per_token_logps - old_per_token_logps)  # [B*num_gen, R]
+        log_ratio = per_token_logps - old_per_token_logps  # [B, T]
+        masked_log_ratio = log_ratio * completion_mask  # 屏蔽 padding
+        seq_log_mean = masked_log_ratio.sum(dim=1) / completion_mask.sum(dim=1)  # [B]
+        ratio = torch.exp(seq_log_mean)  # [B]
+
         if args.loss_type == "cispo":
             clamped_ratio = torch.clamp(ratio, max=args.epsilon_high).detach()
             per_token_loss = -(clamped_ratio * advantages.unsqueeze(1) * per_token_logps - args.beta * per_token_kl)
