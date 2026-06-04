@@ -28,6 +28,12 @@ from trainer.rollout_engine import create_rollout_engine, compute_per_token_logp
 warnings.filterwarnings('ignore')
 
 
+def unwrap_model(model):
+    if isinstance(model, DistributedDataParallel):
+        model = model.module
+    return getattr(model, "_orig_mod", model)
+
+
 def rep_penalty(text, n=3, cap=0.5):
     toks = re.findall(r"\w+|[^\w\s]", text.lower())
     grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
@@ -144,7 +150,37 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             per_token_loss1 = ratio * advantages.unsqueeze(1)
             per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
             per_token_loss = -(torch.min(per_token_loss1, per_token_loss2) - args.beta * per_token_kl)
-        policy_loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+
+
+        raw_model = unwrap_model(model)
+        lambda_param = raw_model.lambda_param
+
+        seq_loss = (
+                (per_token_loss * completion_mask).sum(dim=1)
+                / completion_mask.sum(dim=1).clamp_min(1)
+        )
+
+        lengths = completion_mask.sum(dim=1).float()  # [B*G]
+        lengths_group = lengths.view(-1, args.num_generations)
+
+        mean_len = lengths_group.mean(dim=1, keepdim=True)
+        std_len = lengths_group.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-4)
+
+        z = (lengths_group - mean_len) / std_len
+
+        lambda_used = lambda_param.float().clamp(-args.lambda_clip, args.lambda_clip)
+
+        w = torch.softmax(lambda_used * z, dim=1) * args.num_generations
+        w = w.view(-1)
+
+        lambda_reg_loss = args.lambda_reg * lambda_param.float().pow(2)
+
+        policy_loss = (seq_loss * w).mean() + lambda_reg_loss
+
+
+
+
         loss = (policy_loss + aux_loss) / args.accumulation_steps  # scalar
         loss.backward()
 
@@ -152,8 +188,16 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
+
+            with torch.no_grad():
+                unwrap_model(model).lambda_param.data.clamp_(
+                    -args.lambda_clip,
+                    args.lambda_clip
+                )
+
             scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
+
             if is_main_process() and step % args.save_interval == 0: rollout_engine.update_policy(model)
 
         if step % args.log_interval == 0 or step == iters:
@@ -200,8 +244,15 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
+
+        with torch.no_grad():
+            unwrap_model(model).lambda_param.data.clamp_(
+                -args.lambda_clip,
+                args.lambda_clip
+            )
+
         scheduler.step()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         if is_main_process() and step % args.save_interval == 0: rollout_engine.update_policy(model)
 
         del prompt_inputs, outputs, completion_ids, per_token_logps, ref_per_token_logps
@@ -248,6 +299,12 @@ if __name__ == "__main__":
     parser.add_argument("--sglang_base_url", type=str, default="http://localhost:8998", help="SGLang服务器URL")
     parser.add_argument("--sglang_model_path", type=str, default="../model", help="SGLang tokenizer路径")
     parser.add_argument("--sglang_shared_path", type=str, default="./sglang_ckpt_grpo", help="SGLang共享存储路径")
+
+    parser.add_argument("--lambda_init", type=float, default=0.0, help="lambda-GRPO的lambda初始值")
+    parser.add_argument("--lambda_lr", type=float, default=1e-3, help="lambda-GRPO的lambda学习率")
+    parser.add_argument("--lambda_clip", type=float, default=5.0, help="lambda绝对值裁剪上限")
+    parser.add_argument("--lambda_reg", type=float, default=1e-4, help="lambda的L2正则")
+
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -281,6 +338,10 @@ if __name__ == "__main__":
     base_weight = args.from_weight
     # Policy模型
     model, tokenizer = init_model(lm_config, base_weight, device=args.device)
+    # lambda-GRPO: 注册为模型参数
+    model.lambda_param = torch.nn.Parameter(
+        torch.tensor(float(args.lambda_init), device=args.device)
+    )
     # Reference模型
     ref_model, _ = init_model(lm_config, base_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
@@ -302,6 +363,25 @@ if __name__ == "__main__":
                             thinking_ratio=args.thinking_ratio)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+
+    decay_params = []
+    lambda_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name == "lambda_param":
+            lambda_params.append(param)
+        else:
+            decay_params.append(param)
+
+    optimizer = optim.AdamW(
+        [
+            {"params": decay_params, "lr": args.learning_rate},
+            {"params": lambda_params, "lr": args.lambda_lr},
+        ]
+    )
+
     loader_for_count = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler)
     iters = len(loader_for_count)
     total_optimizer_steps = math.ceil(iters / args.accumulation_steps) * args.epochs
@@ -310,9 +390,24 @@ if __name__ == "__main__":
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
-        model.load_state_dict(ckp_data['model'])
-        optimizer.load_state_dict(ckp_data['optimizer'])
-        scheduler.load_state_dict(ckp_data['scheduler'])
+        missing, unexpected = model.load_state_dict(ckp_data['model'], strict=False)
+
+        if is_main_process():
+            Logger(f"load_state_dict missing keys: {missing}")
+            Logger(f"load_state_dict unexpected keys: {unexpected}")
+
+        try:
+            optimizer.load_state_dict(ckp_data['optimizer'])
+        except ValueError as e:
+            if is_main_process():
+                Logger(f"[lambda-GRPO] optimizer参数组和旧checkpoint不一致，跳过optimizer恢复: {e}")
+
+        try:
+            scheduler.load_state_dict(ckp_data['scheduler'])
+        except Exception as e:
+            if is_main_process():
+                Logger(f"[lambda-GRPO] scheduler恢复失败，跳过scheduler恢复: {e}")
+
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
 
